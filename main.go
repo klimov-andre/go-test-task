@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -25,14 +30,14 @@ type Urls struct {
 	Urls []string `json:"urls"`
 }
 
-// UrlResult структура содержащая результат (Response) запроса (Url) и возникшую при этом ошибку (error)
+// UrlResult структура содержащая результат (Response) запроса Url (Url) и возникшую при этом ошибку (error)
 type UrlResult struct {
 	Url      string `json:"url"`
 	Response []byte `json:"response"`
 	error    error  // error служебное поле, не экспортируем
 }
 
-// ResultToUser структура конечно ответа пользователю
+// ResultToUser структура итогового ответа пользователю
 type ResultToUser struct {
 	Error     string      `json:"error"`
 	Responses []UrlResult `json:"responses"`
@@ -47,39 +52,54 @@ func RequestUrl(url string) ([]byte, error) {
 	}
 	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Println(err)
 		return []byte{}, err
 	}
 
 	return ioutil.ReadAll(resp.Body)
 }
 
-// Запрашивает информацию по всем url в списке urls и записывает результат в канал out
-func QueryUrls(urls []string, out chan<- UrlResult) {
-	tasks := make(chan string, MaxSimultaneousUrlRequests)
-
-	// эта горутина формирует список задач
-	go func() {
-		defer close(tasks)
-
-		for _, url := range urls {
-			tasks <- url
-		}
-	}()
+// QueryUrls асинхронно запрашивает информацию по всем url в списке (urls) и записывает результат в канал (out)
+// parentWg - WaitGroup вызывающего метода
+// urls список url
+// workersCount кол-во одновременно запрашивающих горутин
+// out канал для записи результатов
+// quit канал для опроса экстренного выхода
+func QueryUrls(parentWg *sync.WaitGroup, urls []string, workersCount int, out chan<- UrlResult, quit chan struct{}) {
+	defer parentWg.Done()
+	tasks := make(chan string, len(urls)) // список urlов-задач
 
 	var wg sync.WaitGroup
-	// в цикле на каждую задачу создается горутина,
-	// которая запрашивает информацию по url и пишет в результирующий канал out
-	for task := range tasks {
+	// создаем рабочие горутины, которые будут посылать запросы
+	for i := 0; i < workersCount; i++ {
 		wg.Add(1)
-		go func(task string) {
+		go func() {
 			defer wg.Done()
 
-			result, err := RequestUrl(task)
-			out <- UrlResult{task, result, err}
-		}(task)
+			for {
+				select {
+				case task, ok := <-tasks:
+					// канал закрыт, значит уже нет заданий и можно завершаться
+					if !ok {
+						return
+					}
+					result, err := RequestUrl(task)
+					out <- UrlResult{task, result, err}
+
+				case <-quit:
+					// прекращаем работу
+					return
+				}
+			}
+		}()
 	}
 
+	//список задач спокойно формируем синхронно
+	for _, url := range urls {
+		tasks <- url
+	}
+	// все задачи сформированы, можно закрыть канал
+	close(tasks)
+	// ждем завершения работающих горутин
 	wg.Wait()
 }
 
@@ -109,55 +129,91 @@ func Handle(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ставим оповещение на закрытие соединения клиентом
-	notify := rw.(http.CloseNotifier).CloseNotify()
-	go func() {
-		// TODO: доработать обработчик, чтобы убивались все горутины и ничего не отправлялось
-		<-notify
-		fmt.Println("HTTP connection just closed.")
-	}()
-
 	results := ResultToUser{}
-	out := make(chan UrlResult, len(request.Urls)) // канал результатов обработки urlов
+	pipeline := make(chan UrlResult, len(request.Urls)) // канал результатов обработки urlов
+	quit := make(chan struct{})                         // канал обработки закрытия соединения клиентом
+
+	// количество одновременно запрашивающих горутин не больше MaxSimultaneousUrlRequests
+	workersCount := MaxSimultaneousUrlRequests
+	if len(request.Urls) < MaxSimultaneousUrlRequests {
+		workersCount = len(request.Urls)
+	}
 
 	// опращиваем урлы
-	go QueryUrls(request.Urls, out)
+	var wait sync.WaitGroup
+	wait.Add(1)
+	go QueryUrls(&wait, request.Urls, workersCount, pipeline, quit)
+
+	needToSend := true // по умолчанию результаты отослать надо, но если сервер закрыл соединение - то нет
+
+	// Ставим оповещение на закрытие соединения клиентом
+	connectionClose := rw.(http.CloseNotifier).CloseNotify()
 
 	// формируем итоговый ответ пользователю
+Loop:
 	for i := 0; i < len(request.Urls); i++ {
-		res := <-out
-		if res.error != nil {
-			// TODO: завершаем все остальные горутины
-			results.Error = res.error.Error()
-			fmt.Println("Error встретилась ", res.error.Error())
+		select {
+		case <-connectionClose:
+			// оповещаем рабочие горутины о необходимости завершения
+			close(quit)
+			// в этом случае отправлять пользователю ничего не надо, т.к. уже некуда
+			needToSend = false
+			break Loop
+
+		case res := <-pipeline:
+			// при ошибке в обработке хоть одного url завершаем работу
+			if res.error != nil {
+				// завершаем все остальные горутины
+				close(quit)
+				// пишем ошибку в результирующую структуру
+				results.Error = res.error.Error()
+				// результаты запросов из ответа убираем
+				results.Responses = nil
+				break Loop
+			} else {
+				results.Responses = append(results.Responses, res)
+			}
+
 		}
-		results.Responses = append(results.Responses, res)
 	}
 
-	// упаковываем и отправляем
-	res, err := json.Marshal(results)
-	if err != nil {
-		// TODO: отправляем ошибку пользователю
-		fmt.Println("Error on marshal")
-		return
+	// Ожидаем завершения всех работающих горутин
+	wait.Wait()
+
+	if needToSend {
+		// упаковываем и отправляем
+		res, err := json.Marshal(results)
+		if err != nil {
+			log.Println("Error on marshal ", err.Error())
+			http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write(res)
 	}
-	rw.Header().Set("Content-Type", "application/json")
-	rw.Write(res)
+
 }
 
-// ClientCheck проверяет условие, что сервер не обслуживает больше 100 запросов одновременно
+// HandleConnection проверяет условие, что сервер не обслуживает больше 100 запросов одновременно
 // конечно горутины будут висеть в ожидании, но зато не будут отклоняться запросы пользователей
-func ClientCheck(h http.Handler) http.Handler {
+// shutdown служит индикатором того, что придется закрыть все соединения
+// h следующий хэндлер
+func HandleConnection(shutdown chan struct{}, h http.Handler) http.Handler {
 	// limiter своего рода семафор для контроля числа одновременно обрабатывающихся запросов
 	limiter := make(chan struct{}, MaxSimultaneousClients)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// пробуем взять значение из канала-семафора
-		limiter <- struct{}{}
-		defer func() { <-limiter }()
+		select {
+		case <-shutdown: // нотификация от системы на завершение
+			// чтобы пользователь не волновался, скинем ему ошибку
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
 
-		// передаем запрос следующему хэндлу
-		h.ServeHTTP(w, r)
+		case limiter <- struct{}{}: // пробуем добавить значение в канал-семафор
+			defer func() { <-limiter }()
+			// передаем запрос следующему хэндлу
+			h.ServeHTTP(w, r)
+		}
 	})
 }
 
@@ -167,9 +223,38 @@ func main() {
 		HandlePattern string = "/post"
 	)
 
-	http.Handle(HandlePattern, ClientCheck(http.HandlerFunc(Handle)))
-	err := http.ListenAndServe(ListenAddr, http.DefaultServeMux)
-	if err != nil {
-		fmt.Println(err)
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	// т.к. shutdown не закрывается, поэтому не очень удобно осуществлять закрытие висящих в ожидании соединений
+	// quit будет закрываться при появлении сигнала из системы
+	quit := make(chan struct{})
+
+	// создаем сервер
+	mux := http.NewServeMux()
+	mux.Handle(HandlePattern, HandleConnection(quit, http.HandlerFunc(Handle)))
+	server := &http.Server{Addr: ListenAddr, Handler: mux}
+
+	// запускаем сервер
+	go func() {
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			log.Println("ListenAndServe: ", err)
+		}
+	}()
+	log.Println("Server started")
+
+	// блочимся до того момента, пока пользователь или система не прервет исполнение
+	<-shutdown
+	log.Println("Interruption from OS")
+
+	// исполнение прервано, оповещаем об этом ждущие горутины, путем закрытия канала quit
+	close(quit)
+	// выключаем сервер
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := server.Shutdown(ctx); err != nil {
+		log.Println(err)
 	}
+	cancel()
+
+	log.Println("Server stopped")
 }
